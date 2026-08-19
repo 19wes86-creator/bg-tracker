@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>BG Tracker</title>
+<meta name="theme-color" content="#14161c" />
+<meta name="description" content="Type 1 diabetes pattern tracker" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="BG Tracker" />
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #14161c; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+const EXERCISE_TYPES = ["Run", "Walk", "Lift", "Bike", "Other"];
+const STORAGE_KEY = "bg-tracker-entries";
+const EST = "America/New_York";
+
+function formatEST(iso) {
+  return new Date(iso).toLocaleString("en-US", {
+    timeZone: EST, month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+  });
+}
+
+function nowESTForInput() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: EST, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(new Date());
+  const get = (t) => parts.find((p) => p.type === t).value;
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}`;
+}
+
+function estInputToISO(localStr) {
+  const [datePart, timePart] = localStr.split("T");
+  const [y, m, d] = datePart.split("-").map(Number);
+  const [hh, mm] = timePart.split(":").map(Number);
+  const guessUTC = new Date(Date.UTC(y, m - 1, d, hh, mm));
+  const estStr = new Intl.DateTimeFormat("en-US", {
+    timeZone: EST, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+  }).format(guessUTC);
+  const [dPart, tPart] = estStr.split(", ");
+  const [em, ed, ey] = dPart.split("/").map(Number);
+  const [eh, emin] = tPart.split(":").map(Number);
+  const estAsUTC = Date.UTC(ey, em - 1, ed, eh, emin);
+  const offsetMs = estAsUTC - guessUTC.getTime();
+  return new Date(guessUTC.getTime() - offsetMs).toISOString();
+}
+
+function bucketLabel(hrs) {
+  const start = Math.floor(hrs * 2) / 2;
+  return `${start}-${start + 0.5}h`;
+}
+
+function emptyEntry() {
+  return {
+    id: null, timestamp: nowESTForInput(), bg: "", iob: "", basal: "",
+    foodCarb: false, foodProtein: false, foodFat: false,
+    carbG: "", proteinG: "", fatG: "", showFoodDetail: false,
+    stress: "", exerciseType: "", exerciseDuration: "", training: false,
+    isf: "", notes: "",
+  };
+}
+
+function foodTagLabel(e) {
+  const tags = [];
+  if (e.foodCarb) tags.push("Carb");
+  if (e.foodProtein) tags.push("Protein");
+  if (e.foodFat) tags.push("Fat");
+  return tags.length ? tags.join("+") : null;
+}
+
+function loadEntries() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) { return []; }
+}
+function saveEntries(entries) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(entries)); return true; }
+  catch (e) { return false; }
+}
+
+const COLORS = ["#5b8def", "#e0664c", "#4caf7d", "#c9a227", "#9b6bd6"];
+
+// Minimal dependency-free SVG line chart.
+function LineChart({ data, xKey, seriesKeys, height = 260 }) {
+  const width = 100; // percent-based viewBox, scales with container
+  const padL = 8, padR = 2, padT = 6, padB = 10;
+  const allVals = [];
+  data.forEach((row) => seriesKeys.forEach((k) => { if (row[k] != null) allVals.push(row[k]); }));
+  if (allVals.length === 0) {
+    return <div style={{ color: "#7a8296", fontSize: 13, padding: "24px 0", textAlign: "center" }}>Not enough data yet.</div>;
+  }
+  const min = Math.min(...allVals), max = Math.max(...allVals);
+  const yMin = Math.floor((min - 1) * 2) / 2, yMax = Math.ceil((max + 1) * 2) / 2;
+  const n = data.length;
+  const x = (i) => padL + (i / Math.max(1, n - 1)) * (width - padL - padR);
+  const y = (v) => padT + (1 - (v - yMin) / (yMax - yMin || 1)) * (100 - padT - padB);
+
+  return (
+    <div>
+      <svg viewBox={`0 0 ${width} 100`} style={{ width: "100%", height }} preserveAspectRatio="none">
+        {[0, 0.25, 0.5, 0.75, 1].map((f, i) => (
+          <line key={i} x1={padL} x2={width - padR} y1={padT + f * (100 - padT - padB)} y2={padT + f * (100 - padT - padB)}
+            stroke="#2a2f3a" strokeWidth="0.3" />
+        ))}
+        {seriesKeys.map((k, si) => {
+          const pts = data.map((row, i) => (row[k] != null ? [x(i), y(row[k])] : null)).filter(Boolean);
+          if (pts.length === 0) return null;
+          const path = pts.map((p, i) => `${i === 0 ? "M" : "L"}${p[0]},${p[1]}`).join(" ");
+          return (
+            <g key={k}>
+              <path d={path} fill="none" stroke={COLORS[si % COLORS.length]} strokeWidth="0.7" vectorEffect="non-scaling-stroke" />
+              {pts.map((p, i) => <circle key={i} cx={p[0]} cy={p[1]} r="0.9" fill={COLORS[si % COLORS.length]} />)}
+            </g>
+          );
+        })}
+      </svg>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, fontSize: 11, color: "#a8afc0", marginTop: 4 }}>
+        {seriesKeys.map((k, i) => (
+          <span key={k} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 4, background: COLORS[i % COLORS.length], display: "inline-block" }} />
+            {k}
+          </span>
+        ))}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#7a8296", marginTop: 2 }}>
+        <span>{data[0] ? data[0][xKey] : ""}</span>
+        <span>{data[data.length - 1] ? data[data.length - 1][xKey] : ""}</span>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, required, children }) {
+  return (
+    <div style={styles.field}>
+      <label style={styles.label}>{label}{required && <span style={styles.req}> *</span>}</label>
+      {children}
+    </div>
+  );
+}
+
+function App() {
+  const [entries, setEntries] = useState(() => loadEntries());
+  const [tab, setTab] = useState("log");
+  const [form, setForm] = useState(emptyEntry());
+  const [error, setError] = useState("");
+  const [insightAnchor, setInsightAnchor] = useState("exercise");
+
+  function persist(next) {
+    setEntries(next);
+    if (!saveEntries(next)) setError("Save failed — storage may be full.");
+  }
+
+  function updateField(key, val) { setForm((f) => ({ ...f, [key]: val })); }
+
+  function submitEntry() {
+    if (!form.bg) { setError("BG reading required."); return; }
+    setError("");
+    const entry = { ...form, id: Date.now(), timestamp: estInputToISO(form.timestamp) };
+    const next = [...entries, entry].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    persist(next);
+    setForm(emptyEntry());
+    setTab("history");
+  }
+
+  function deleteEntry(id) { persist(entries.filter((e) => e.id !== id)); }
+
+  const sorted = useMemo(() => [...entries].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp)), [entries]);
+
+  const exerciseInsights = useMemo(() => {
+    const anchors = sorted.filter((e) => e.exerciseType);
+    const byType = {};
+    anchors.forEach((anchor) => {
+      const t0 = new Date(anchor.timestamp).getTime();
+      sorted.forEach((e) => {
+        if (!e.bg) return;
+        const dt = (new Date(e.timestamp).getTime() - t0) / 3600000;
+        if (dt < 0 || dt > 6) return;
+        const type = anchor.exerciseType;
+        if (!byType[type]) byType[type] = {};
+        const b = bucketLabel(dt);
+        (byType[type][b] = byType[type][b] || []).push(Number(e.bg));
+      });
+    });
+    const buckets = Array.from({ length: 12 }, (_, i) => `${i * 0.5}-${i * 0.5 + 0.5}h`);
+    const chartData = buckets.map((b) => {
+      const row = { bucket: b };
+      Object.keys(byType).forEach((type) => {
+        const vals = byType[type][b];
+        if (vals && vals.length) row[type] = Math.round((vals.reduce((a, v) => a + v, 0) / vals.length) * 10) / 10;
+      });
+      return row;
+    });
+    return { chartData, types: Object.keys(byType) };
+  }, [sorted]);
+
+  const foodInsights = useMemo(() => {
+    const anchors = sorted.filter((e) => foodTagLabel(e));
+    const byTag = {};
+    anchors.forEach((anchor) => {
+      const tag = foodTagLabel(anchor);
+      const t0 = new Date(anchor.timestamp).getTime();
+      sorted.forEach((e) => {
+        if (!e.bg) return;
+        const dt = (new Date(e.timestamp).getTime() - t0) / 3600000;
+        if (dt < 0 || dt > 4) return;
+        if (!byTag[tag]) byTag[tag] = {};
+        const b = bucketLabel(dt);
+        (byTag[tag][b] = byTag[tag][b] || []).push(Number(e.bg));
+      });
+    });
+    const buckets = Array.from({ length: 8 }, (_, i) => `${i * 0.5}-${i * 0.5 + 0.5}h`);
+    const chartData = buckets.map((b) => {
+      const row = { bucket: b };
+      Object.keys(byTag).forEach((tag) => {
+        const vals = byTag[tag][b];
+        if (vals && vals.length) row[tag] = Math.round((vals.reduce((a, v) => a + v, 0) / vals.length) * 10) / 10;
+      });
+      return row;
+    });
+    return { chartData, tags: Object.keys(byTag) };
+  }, [sorted]);
+
+  return (
+    <div style={styles.app}>
+      <div style={styles.header}>
+        <div style={styles.headerTitle}>BG TRACKER</div>
+        <div style={styles.headerSub}>Type 1 · pattern log · mmol/L · EST</div>
+      </div>
+
+      <div style={styles.tabs}>
+        {["log", "history", "insights"].map((t) => (
+          <button key={t} onClick={() => setTab(t)} style={{ ...styles.tabBtn, ...(tab === t ? styles.tabBtnActive : {}) }}>
+            {t.toUpperCase()}
+          </button>
+        ))}
+      </div>
+
+      {error && <div style={styles.error}>{error}</div>}
+
+      {tab === "log" && (
+        <div style={styles.form}>
+          <Field label="Time (EST)">
+            <input type="datetime-local" value={form.timestamp} onChange={(e) => updateField("timestamp", e.target.value)} style={styles.input} />
+          </Field>
+          <Field label="BG (mmol/L)" required>
+            <input type="number" step="0.1" value={form.bg} onChange={(e) => updateField("bg", e.target.value)} style={styles.input} placeholder="6.7" />
+          </Field>
+          <div style={styles.row2}>
+            <Field label="IOB (u)">
+              <input type="number" step="0.1" value={form.iob} onChange={(e) => updateField("iob", e.target.value)} style={styles.input} />
+            </Field>
+            <Field label="Basal (u/hr)">
+              <input type="number" step="0.05" value={form.basal} onChange={(e) => updateField("basal", e.target.value)} style={styles.input} />
+            </Field>
+          </div>
+          <Field label="Food">
+            <div style={styles.tagRow}>
+              {["Carb", "Protein", "Fat"].map((tag) => {
+                const key = "food" + tag;
+                return (
+                  <button key={tag} onClick={() => updateField(key, !form[key])} style={{ ...styles.tag, ...(form[key] ? styles.tagActive : {}) }}>
+                    {tag}
+                  </button>
+                );
+              })}
+              <button onClick={() => updateField("showFoodDetail", !form.showFoodDetail)} style={styles.detailToggle}>
+                {form.showFoodDetail ? "− hide grams" : "+ add detail"}
+              </button>
+            </div>
+            {form.showFoodDetail && (
+              <div style={styles.row3}>
+                <input type="number" placeholder="carb g" value={form.carbG} onChange={(e) => updateField("carbG", e.target.value)} style={styles.input} />
+                <input type="number" placeholder="protein g" value={form.proteinG} onChange={(e) => updateField("proteinG", e.target.value)} style={styles.input} />
+                <input type="number" placeholder="fat g" value={form.fatG} onChange={(e) => updateField("fatG", e.target.value)} style={styles.input} />
+              </div>
+            )}
+          </Field>
+          <Field label="Exercise">
+            <div style={styles.tagRow}>
+              {EXERCISE_TYPES.map((t) => (
+                <button key={t} onClick={() => updateField("exerciseType", form.exerciseType === t ? "" : t)} style={{ ...styles.tag, ...(form.exerciseType === t ? styles.tagActive : {}) }}>
+                  {t}
+                </button>
+              ))}
+            </div>
+            {form.exerciseType && (
+              <div style={styles.row2}>
+                <input type="number" placeholder="duration (min)" value={form.exerciseDuration} onChange={(e) => updateField("exerciseDuration", e.target.value)} style={styles.input} />
+                <button onClick={() => updateField("training", !form.training)} style={{ ...styles.tag, ...(form.training ? styles.tagActive : {}) }}>
+                  Training day
+                </button>
+              </div>
+            )}
+          </Field>
+          <div style={styles.row2}>
+            <Field label="Stress (1-5)">
+              <input type="number" min="1" max="5" value={form.stress} onChange={(e) => updateField("stress", e.target.value)} style={styles.input} />
+            </Field>
+            <Field label="ISF (mmol/L per u)">
+              <input type="number" step="0.1" value={form.isf} onChange={(e) => updateField("isf", e.target.value)} style={styles.input} />
+            </Field>
+          </div>
+          <Field label="Notes">
+            <textarea value={form.notes} onChange={(e) => updateField("notes", e.target.value)} style={styles.textarea} rows={2} />
+          </Field>
+          <button onClick={submitEntry} style={styles.submitBtn}>Save entry</button>
+        </div>
+      )}
+
+      {tab === "history" && (
+        <div style={styles.history}>
+          {sorted.length === 0 && <div style={styles.empty}>No entries yet. Log one to start.</div>}
+          {[...sorted].reverse().map((e) => (
+            <div key={e.id} style={styles.entryCard}>
+              <div style={styles.entryTop}>
+                <span style={styles.entryBg}>{e.bg} <span style={styles.entryUnit}>mmol/L</span></span>
+                <span style={styles.entryTime}>{formatEST(e.timestamp)}</span>
+                <button onClick={() => deleteEntry(e.id)} style={styles.deleteBtn}>×</button>
+              </div>
+              <div style={styles.entryTags}>
+                {e.iob && <span style={styles.pill}>IOB {e.iob}u</span>}
+                {e.basal && <span style={styles.pill}>Basal {e.basal}</span>}
+                {foodTagLabel(e) && <span style={styles.pill}>{foodTagLabel(e)}</span>}
+                {e.exerciseType && <span style={styles.pill}>{e.exerciseType} {e.exerciseDuration ? e.exerciseDuration + "m" : ""}</span>}
+                {e.training && <span style={styles.pill}>Training</span>}
+                {e.stress && <span style={styles.pill}>Stress {e.stress}/5</span>}
+              </div>
+              {e.notes && <div style={styles.entryNotes}>{e.notes}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tab === "insights" && (
+        <div style={styles.insights}>
+          <div style={styles.tabs}>
+            <button onClick={() => setInsightAnchor("exercise")} style={{ ...styles.tabBtn, ...(insightAnchor === "exercise" ? styles.tabBtnActive : {}) }}>EXERCISE</button>
+            <button onClick={() => setInsightAnchor("food")} style={{ ...styles.tabBtn, ...(insightAnchor === "food" ? styles.tabBtnActive : {}) }}>FOOD</button>
+          </div>
+          {insightAnchor === "exercise" && (
+            <>
+              <div style={styles.insightNote}>Average BG by time-since-start, grouped by exercise type. Descriptive only — reflects your logged history, not a prediction.</div>
+              {exerciseInsights.types.length === 0
+                ? <div style={styles.empty}>Log exercise + follow-up BG readings to see patterns.</div>
+                : <LineChart data={exerciseInsights.chartData} xKey="bucket" seriesKeys={exerciseInsights.types} />}
+            </>
+          )}
+          {insightAnchor === "food" && (
+            <>
+              <div style={styles.insightNote}>Average BG by time-since-meal, grouped by macro tag combo. Descriptive only.</div>
+              {foodInsights.tags.length === 0
+                ? <div style={styles.empty}>Log food tags + follow-up BG readings to see patterns.</div>
+                : <LineChart data={foodInsights.chartData} xKey="bucket" seriesKeys={foodInsights.tags} />}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const styles = {
+  app: { fontFamily: "'JetBrains Mono', 'SF Mono', Menlo, monospace", background: "#14161c", color: "#e6e8ee", minHeight: "100vh", padding: "16px", maxWidth: 480, margin: "0 auto" },
+  header: { marginBottom: 16, borderBottom: "1px solid #2a2f3a", paddingBottom: 12 },
+  headerTitle: { fontSize: 20, fontWeight: 700, letterSpacing: 1 },
+  headerSub: { fontSize: 12, color: "#7a8296", marginTop: 2 },
+  tabs: { display: "flex", gap: 6, marginBottom: 16 },
+  tabBtn: { flex: 1, background: "#1c1f27", color: "#7a8296", border: "1px solid #2a2f3a", padding: "8px 0", fontSize: 11, letterSpacing: 0.5, cursor: "pointer", borderRadius: 4, fontFamily: "inherit" },
+  tabBtnActive: { background: "#5b8def", color: "#0d0f14", border: "1px solid #5b8def", fontWeight: 700 },
+  error: { background: "#3a1f22", color: "#e0664c", padding: "8px 10px", borderRadius: 4, fontSize: 12, marginBottom: 12 },
+  form: { display: "flex", flexDirection: "column", gap: 12 },
+  field: { display: "flex", flexDirection: "column", gap: 4 },
+  label: { fontSize: 11, color: "#7a8296", letterSpacing: 0.5 },
+  req: { color: "#e0664c" },
+  input: { background: "#1c1f27", border: "1px solid #2a2f3a", color: "#e6e8ee", padding: "9px 10px", borderRadius: 4, fontSize: 14, fontFamily: "inherit", width: "100%", boxSizing: "border-box" },
+  textarea: { background: "#1c1f27", border: "1px solid #2a2f3a", color: "#e6e8ee", padding: "9px 10px", borderRadius: 4, fontSize: 13, fontFamily: "inherit", width: "100%", boxSizing: "border-box", resize: "vertical" },
+  row2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 },
+  row3: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 8 },
+  tagRow: { display: "flex", gap: 6, flexWrap: "wrap" },
+  tag: { background: "#1c1f27", border: "1px solid #2a2f3a", color: "#a8afc0", padding: "6px 12px", borderRadius: 14, fontSize: 12, cursor: "pointer", fontFamily: "inherit" },
+  tagActive: { background: "#5b8def22", border: "1px solid #5b8def", color: "#5b8def" },
+  detailToggle: { background: "none", border: "none", color: "#7a8296", fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: "inherit" },
+  submitBtn: { background: "#5b8def", color: "#0d0f14", border: "none", padding: "12px", borderRadius: 4, fontSize: 14, fontWeight: 700, cursor: "pointer", marginTop: 4, fontFamily: "inherit" },
+  history: { display: "flex", flexDirection: "column", gap: 10 },
+  empty: { color: "#7a8296", fontSize: 13, padding: "20px 0", textAlign: "center" },
+  entryCard: { background: "#1c1f27", border: "1px solid #2a2f3a", borderRadius: 6, padding: 12 },
+  entryTop: { display: "flex", alignItems: "center", gap: 8, marginBottom: 6 },
+  entryBg: { fontSize: 18, fontWeight: 700 },
+  entryUnit: { fontSize: 10, color: "#7a8296", fontWeight: 400 },
+  entryTime: { fontSize: 11, color: "#7a8296", marginLeft: "auto" },
+  deleteBtn: { background: "none", border: "none", color: "#7a8296", fontSize: 18, cursor: "pointer", lineHeight: 1, padding: "0 2px" },
+  entryTags: { display: "flex", gap: 6, flexWrap: "wrap" },
+  pill: { background: "#14161c", border: "1px solid #2a2f3a", color: "#a8afc0", fontSize: 10, padding: "3px 8px", borderRadius: 10 },
+  entryNotes: { fontSize: 12, color: "#a8afc0", marginTop: 8, fontStyle: "italic" },
+  insights: { display: "flex", flexDirection: "column", gap: 10 },
+  insightNote: { fontSize: 11, color: "#7a8296", lineHeight: 1.4 },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("sw.js").catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
